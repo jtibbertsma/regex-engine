@@ -1,6 +1,6 @@
 # Regex Engine
 
-This is a simple regular expression engine that I wrote back during my senior year of university as a fun side project. Once upon a time, this thing actually worked, and I had lots of regex syntax implemented such as literal matches, greedy and lazy repetition, lookbehinds, subexpression calls, etc.
+This is a simple regular expression engine that I wrote back during my senior year of university as a fun side project. Once upon a time, this thing actually worked, and I had lots of regex syntax implemented such as literal matches, greedy and lazy repetition, lookaheads, subexpression calls, etc.
 
 The problem is that I wrote this before I knew how to use source control, so I broke the whole thing when I tried to implement unicode and eventually gave up because it was too tedious. (I did learn a lot about unicode, though.)
 
