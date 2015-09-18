@@ -1,0 +1,11 @@
+.DS_Store
+classtest*
+*.txt
+*.py*
+names
+puke*
+*.o
+*.DSYM
+output
+*.so
+cont

@@ -1,0 +1,374 @@
+/* core.c
+ *
+ * Implementation of the core regex matching object.
+ */
+
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "core.h"
+#include "bts.h"
+#include "range.h"
+
+
+typedef struct _branch branch_t;
+
+/* branch
+ *
+ * Represents a linear sequence of chunks.
+ */
+struct _branch {
+   chunk_t** chunks;    // sequence of chunks
+   int load;            // next position to add a chunk
+   int capacity;        // capacity of chunks array
+   int ngroup;          // number of groups in the branch
+   branch_t* next;      // pointer to subsequent branch
+};
+
+/* core
+ *
+ * Declaration of core object.
+ */
+struct _reg_core {
+   branch_t* start;     // first branch to start matching from
+   branch_t* insert;    // next branch to add a new chunk
+};
+
+#define DEFCAP 8
+
+
+/************************branch operations***************************/
+
+
+/** ensure_capacity
+  *
+  * Make sure the chunks array is large enough to hold another new
+  * chunk.
+  */
+static void branch_ensure_capacity(branch_t* obj) {
+   if (obj->load == obj->capacity) {
+      int newcap = obj->capacity * 2;
+      chunk_t** newarray = calloc(newcap, sizeof(chunk_t*));
+      assert(newarray != NULL);
+      memcpy(newarray, obj->chunks, obj->capacity*sizeof(chunk_t*));
+      free(obj->chunks);
+      obj->chunks = newarray;
+      obj->capacity = newcap;
+   }
+}
+
+/** add_chunk
+  *
+  * Add a new chunk to the branch, returning a pointer to it.
+  * If necessary, reallocate the chunks array.
+  */
+static chunk_t* branch_add_chunk(branch_t* obj) {
+   assert(obj != NULL);
+   branch_ensure_capacity(obj);
+   chunk_t* new_chunk = chunk_new(obj->load);
+   obj->chunks[obj->load++] = new_chunk;
+   return new_chunk;
+}
+
+/** new
+  *
+  * Create a new branch.
+  */
+static branch_t* branch_new() {
+   branch_t* obj = malloc(sizeof(branch_t));
+   assert(obj != NULL);
+   obj->capacity = DEFCAP;
+   obj->load = 0;
+   obj->next = NULL;
+   obj->ngroup = 0;
+   obj->chunks = calloc(obj->capacity, sizeof(chunk_t*));
+   assert(obj->chunks != NULL);
+   return obj;
+}
+
+/** free
+  *
+  * Free the memory of a branch, including each chunk inside of
+  * the branch.
+  */
+static void branch_free(branch_t* obj) {
+   if (obj != NULL) {
+      for (int i = 0; i < obj->load; ++i) {
+         chunk_free(obj->chunks[i]);
+      }
+      free(obj->chunks);
+      free(obj);
+   }
+}
+
+/** match
+  *
+  * Go through the chunks in the branch and look for a match.
+  */
+static char* branch_match(branch_t* obj, bts_t* stack, range_t* gr) {
+   state_t* top = bts_top(stack);
+   char* str = top->str;
+   while (!bts_empty(stack)) {
+      top = bts_top(stack);
+      int next_index = top->index;
+      if (next_index >= obj->load) {
+         if (str != NULL) {
+            bts_pop(stack);
+            return str;
+         } else {
+            return top->str;
+         }
+      }
+      str = chunk_match(obj->chunks[next_index], stack, gr);
+   }
+   return str;
+}
+
+/************************public functions****************************/
+
+range_t* core_match(core_t* obj, char* str, bts_t* outer) {
+   assert(obj != NULL);
+   assert(str != NULL);
+   int ngr = 1, nbr = 0;  // next group, next branch
+   range_t* groups = calloc(core_groups(obj), sizeof(range_t));
+   assert(groups != NULL);
+   branch_t* curr = obj->start;
+   if (curr == NULL) {    // empty regular expression
+      groups[0].begin = str;
+      groups[0].end   = str;
+      return groups;
+   }
+   do {
+      memset(groups, 0, core_groups(obj) * sizeof(range_t));
+      bts_t* stack = bts_new();
+      bts_push(stack, 0, str, 0, ngr, false, NULL, 0, NULL);
+      char* end = branch_match(curr, stack, groups);
+      if (end != NULL) {
+         groups[0].begin = str;
+         groups[0].end   = end;
+         if (outer != NULL) {
+            if (!bts_empty(stack)) {
+               bts_push(outer, 0, str, 0, 0, true, stack, nbr, groups);
+            } else {
+               bts_free(stack);
+               bts_push(outer, 0, str, 0, 0, true, NULL, 0, NULL);
+            }
+         } else {
+            bts_free(stack);
+         }
+         return groups;
+      }
+      ngr += curr->ngroup;
+      ++nbr;
+      curr = curr->next;
+      bts_free(stack);
+   } while (curr != NULL);
+   free(groups);
+   return NULL;
+}
+
+range_t* core_match_continue(core_t* obj, char* str, bts_t* stack,
+                             bts_t* outer, int nbr, range_t* groups) {
+   assert(*str != '\0');
+   branch_t* curr = obj->start;
+   state_t* top = bts_top(stack);
+   int ngr = top->ngr;
+   for (int i = 0; i < nbr; ++i) {
+      curr = curr->next;
+   }
+   for (;;) {   
+      char* end = branch_match(curr, stack, groups);
+      if (end != NULL) {
+         assert(outer != NULL);
+         groups[0].begin = str;
+         groups[0].end   = end;
+         if (!bts_empty(stack)) {
+            bts_push(outer, 0, str, 0, 0, true, stack, nbr, groups);
+         } else {
+            bts_free(stack);
+            bts_push(outer, 0, str, 0, 0, true, NULL, 0, NULL);
+         }
+         return groups;
+      }
+      bts_free(stack);
+      if (curr->next != NULL) {
+         ngr += curr->ngroup;
+         ++nbr;
+         curr = curr->next;
+         memset(groups, 0, core_groups(obj) * sizeof(range_t));
+         stack = bts_new();
+         bts_push(stack, 0, str, 0, ngr, false, NULL, 0, NULL);
+      } else break;
+   }
+   free(groups);
+   return NULL;
+}
+
+int core_groups(core_t* obj) {
+   assert(obj != NULL);
+   int count = 1;
+   for (branch_t* br = obj->start; br != NULL; br = br->next) {
+      count += br->ngroup;
+   }
+   return count;
+}
+
+chunk_t* core_add_chunk(core_t* obj) {
+   assert(obj != NULL);
+   if (obj->start == NULL) {
+      obj->start = obj->insert = branch_new();
+   }
+   return branch_add_chunk(obj->insert);
+}
+
+void core_add_branch(core_t* obj) {
+   assert(obj != NULL);
+   if (obj->start == NULL) {
+      obj->start = obj->insert = branch_new();
+   }
+   obj->insert->next = branch_new();
+   obj->insert = obj->insert->next;
+}
+
+void core_set_branch(core_t* obj, int ngr) {
+   assert(obj != NULL);
+   if (obj->start != NULL)
+      obj->insert->ngroup = ngr;
+}
+
+core_t* core_new() {
+   core_t* obj = malloc(sizeof(core_t));
+   assert(obj != NULL);
+   obj->start = NULL;
+   obj->insert = NULL;
+   return obj;
+}
+
+void core_free(core_t* obj) {
+   if (obj != NULL) {
+      branch_t* branch = obj->start;
+      while (branch != NULL) {
+         branch_t* next = branch->next;
+         branch_free(branch);
+         branch = next;
+      }
+      free(obj);
+   }
+}
+
+/********************************************************************/
+/* core.h
+ *
+ * This is the core object of the regex engine that checks whether
+ * or not a string matches a pattern. The core is arranged into
+ * a series of chunks that match subpatterns.
+ */
+
+#ifndef __regex_core
+#define __regex_core
+
+typedef struct _reg_core core_t;
+
+#include "chunk.h"
+
+/** match
+  *
+  * Given a pointer to a string, return NULL if the string doesn't
+  * match, or return a pointer to an array of range objects. The 0
+  * index represents the match as a whole while the subsequent
+  * indices are the captured groups.
+  */
+range_t* core_match(core_t*, char*, bts_t*);
+
+/** match_continue
+  *
+  * Used to backtrack into a nested core.
+  */
+range_t* core_match_continue(core_t*, char*, bts_t*,
+                             bts_t*, int, range_t*);
+
+/** groups
+  *
+  * Get the number of groups in the regular expression.
+  */
+int core_groups(core_t*);
+
+/** add_chunk
+  *
+  * Create a new chunk on the current branch and return it.
+  */
+chunk_t* core_add_chunk(core_t*);
+
+/** add_branch
+  *
+  * Create a new branch inside of the core. This allows the core
+  * to represent '|' syntax where several different patterns can
+  * match.
+  */
+void core_add_branch(core_t*);
+
+/** set_branch
+  *
+  * Tells the core how many groups the current branch should have.
+  */
+void core_set_branch(core_t*, int);
+
+/** new
+  *
+  * Create a core containing no chunks.
+  */
+core_t* core_new();
+
+/** free
+  *
+  * Deallocate memory used by the core.
+  */
+void core_free(core_t*);
+
+#endif
+œ˙Ì˛                         ò                          ∞!             ∞!                   __text          __TEXT                  ·            –'  h     Ä            __debug_info    __DWARF         ·      ÷            +  6                  __debug_abbrev  __DWARF         ∑            ◊                             __debug_aranges __DWARF         …      0       È      ¿,                    __debug_macinfo __DWARF         ˘                                           __debug_line    __DWARF         ˘      j            »,                    __debug_loc     __DWARF         c              É                             __debug_str     __DWARF         c      7      É                             __debug_ranges  __DWARF         ö              ∫                             __data          __DATA          ö              ∫                              __cstring       __TEXT          ö            ∫                             __apple_names   __DWARF         û      å      æ       –,                    __apple_objc    __DWARF         *      $       J"                             __apple_namespac__DWARF         N      $       n"                             __apple_types   __DWARF         r      }      í"      †-                    __compact_unwind__LD                  †      $     P.                    __eh_frame      __TEXT          ê             ∞%               h                  ∏.  <   x2  †     P                -                                                      UHâÂHÅÏ∞   Hâ}HâuËHâU‡HÅ}    ï¿4$∂»Hc—HÅ˙    Ñ   Hç=    Hç5    ∫É   Hç    Ë    È    HÅ}Ë    ï¿4$∂»Hc—HÅ˙    Ñ   Hç=    Hç5    ∫Ñ   Hç    Ë    È    «E‹   «Eÿ    Hã}Ë    Hæ       Hc¯Ë    HâE–HÅ}–    ï¡ÄÒÄ·∂—Hc¬H=    Ñ   Hç=    Hç5    ∫á   Hç    Ë    È    HãEHã HâE»HÅ}»    Ö$   HãEËHãM–HâHãEËHãM–HâAHãE–HâE¯È	  È    HãE–Hã}HâE∞Ë    æ    HπˇˇˇˇˇˇˇˇHc¯H¡ÁHãU∞Hâ}®Hâ◊HãU®Ë    HâE†∞ Ë    æ    Hπ        HâE¿Hã}¿HãUËDãE‹âuúDãMúHâMêDâ…H«$    «D$    H«D$    Ë    Hã}»Hãu¿HãU–Ë    HâE∏HÅ}∏    Ñ˛   HãEËHãM–HâHãE∏HãM–HâAHÅ}‡    Ñ√   Hã}¿Ë    ®ÖX   ∏    Aπ   Hã}‡HãUËHãM¿ãuÿLãE–âuåâ∆HâMÄâ¡LâÖxˇˇˇAâ¿LãUÄLâ$ãEåâD$LãùxˇˇˇLâ\$Ë    ÈU   Hã}¿Ë    ∏    Aπ   Hø        HãM‡HãUËHâΩpˇˇˇHâœâ∆â¡Aâ¿H«$    «D$    H«D$    Ë    È	   Hã}¿Ë    HãE–HâE¯ÈR   HãE»ãHãU‹ âU‹ãMÿÅ¡   âMÿHãE»Hã@HâE»Hã}¿Ë    HÅ}»    Ö˛ˇˇHãE–Hâ«Ë    H«E¯    HãE¯HÅƒ∞   ]√fD  UHâÂHÉÏ Hâ}¯HÅ}¯    ï¿4$∂»Hc˘HÅˇ    Ñ   Hç=    Hç5    ∫—   Hç    Ë    È    «EÙ   HãE¯Hã HâEËHÅ}Ë    Ñ    HãEËãHãUÙ âUÙHãEËHã@HâEËÈ“ˇˇˇãEÙHÉƒ ]√D  UHâÂHÉÏ@Hâ}HâuËHâU‡Hã}ËË    HâEÿHãEÿHã@HâE–Hã}ËË    4®Ö   ÈÄ   Hã}ËË    HâEÿHãEÿãâMÃãMÃHãE;Hå5   HÅ}–    Ñ   Hã}ËË    Hã}–Hâ}¯È>   HãEÿHã@HâE¯È-   HcEÃHãMHã	Hã<¡HãuËHãU‡Ë    HâE–ÈhˇˇˇHãE–HâE¯HãE¯HÉƒ@]√fÑ     UHâÂHÅÏ¿   Hâ}HâuËHâU‡HâMÿDâE‘LâM»HãMËDæAÅ¯    ï¿4$D∂¿Ic»HÅ˘    Ñ   Hç=    Hç5    ∫≠   Hç    Ë    È    HãEHã HâE¿Hã}‡Ë    HâE∏HãE∏ãHâM¥«E∞    ãE∞;E‘ç   HãE¿Hã@HâE¿ãE∞   âE∞ÈÿˇˇˇÈ    Hã}¿Hãu‡HãU»Ë    HâE®HÅ}®    Ñ  HÅ}ÿ    ï¿4$∂»Hc—HÅ˙    Ñ   Hç=    Hç5    ∫∑   Hç    Ë    È    HãEËHãM»HâHãE®HãM»HâAHã}‡Ë    ®ÖR   ∏    Aπ   Hã}ÿHãUËHãM‡ãu‘LãE»âu§â∆HâMòâ¡LâEêAâ¿LãUòLâ$ãE§âD$Lã]êLâ\$Ë    ÈR   Hã}‡Ë    ∏    Aπ   Hø        HãMÿHãUËHâ}àHâœâ∆â¡Aâ¿H«$    «D$    H«D$    Ë    HãE»HâE¯È  Hã}‡Ë    Hã}¿HÅ    Ñœ   HãE¿ãHãU¥ âU¥ãM‘Å¡   âM‘HãE¿Hã@HâE¿HãE»Hã}HâEÄË    æ    HπˇˇˇˇˇˇˇˇHc¯H¡ÁLãEÄHâΩxˇˇˇLâ«HãïxˇˇˇË    HâÖpˇˇˇ∞ Ë    æ    Hπ        HâE‡Hã}‡HãUËDãE¥âµlˇˇˇDãçlˇˇˇHâç`ˇˇˇDâ…H«$    «D$    H«D$    Ë    È   È   È ˝ˇˇHãE»Hâ«Ë    H«E¯    HãE¯HÅƒ¿   ]√fêUHâÂHÉÏHâ}¯HÅ}¯    ï¿4$∂»Hc˘HÅˇ    Ñ   Hç=    Hç5    ∫⁄   Hç    Ë    È    HãE¯HÅ8    Ö   Ë    HãM¯HâAHãM¯HâHãE¯HãxË    HÉƒ]√fD  UHâÂHÉÏHâ}¯HÅ}¯    ï¿4$∂»Hc˘HÅˇ    Ñ   Hç=    Hç5    ∫C   Hç    Ë    È    Hã}¯Ë    Hã}¯ãË    HâEHãEHãM¯ãyâ˙Å¬   âQHcœHãu¯Hã6HâŒHãEHÉƒ]√Ä    UHâÂHÉÏHâ}¯HÅ}¯    ï¿4$∂»Hc˘HÅˇ    Ñ   Hç=    Hç5    ∫‚   Hç    Ë    È    HãE¯HÅ8    Ö   Ë    HãM¯HâAHãM¯HâË    HãM¯HãIHâAHãE¯Hã@Hã@HãM¯HâAHÉƒ]√fffff.Ñ     UHâÂHÉÏHâ}¯âuÙHÅ}¯    ï¿4$∂Hc˛HÅˇ    Ñ   Hç=    Hç5    ∫Î   Hç    Ë    È    HãE¯HÅ8    Ñ   ãEÙHãM¯HãIâAHÉƒ]√fD  UHâÂHÉÏHø       Ë    HâE¯HÅ}¯    ï¡ÄÒÄ·∂—Hc¬H=    Ñ   Hç=    Hç5    ∫Ú   Hç    Ë    È    HãE¯H«     HãE¯H«@    HãE¯HÉƒ]√ffff.Ñ     UHâÂHÉÏ Hâ}¯HÅ}¯    ÑG   HãE¯Hã HâEHÅ}    Ñ"   HãEHã@HâEËHã}Ë    HãEËHâEÈ–ˇˇˇHãE¯Hâ«Ë    HÉƒ ]√fÑ     UHâÂHÉÏHâ}¯HÅ}¯    ÑV   «EÙ    ãEÙHãM¯;Aç$   HcEÙHãM¯Hã	Hã<¡Ë    ãEÙ   âEÙÈÃˇˇˇHãE¯Hã Hâ«Ë    HãE¯Hâ«Ë    HÉƒ]√f.Ñ     UHâÂHÉÏ0Hâ}¯Hã}¯ãGHã}¯;GÖ…   Hæ       HãE¯ãH¡·âMÙHc}ÙË    HâEËHÅ}Ë    ï¬ÄÚÄ‚∂ Hc¡H=    Ñ   Hç=    Hç5    ∫5   Hç    Ë    È    HπˇˇˇˇˇˇˇˇHãEËHãU¯HãHãu¯HcvH¡ÊHâ«Hâu‡Hâ÷HãU‡Ë    HãM¯Hã	HâœHâEÿË    HãEËHãM¯HâDãEÙHãE¯Dâ@HÉƒ0]√êUHâÂHÉÏHø        Ë    HâE¯HÅ}¯    ï¡ÄÒÄ·∂—Hc¬H=    Ñ   Hç=    Hç5    ∫P   Hç    Ë    È    Hæ       HãE¯«@   HãE¯«@    HãE¯H«@    HãE¯«@    HãE¯HcxË    Hãu¯HâHãE¯HÅ8    ï¡ÄÒÄ·∂—Hc¬H=    Ñ   Hç=    Hç5    ∫V   Hç    Ë    È    HãE¯HÉƒ]√“            ?               F   c   Çÿ           j      Vö  ÇG  ëpû  Ç  ëh¢  Ç+  ë`≥  Öi  ë\∑  Öi  ëXª  Üÿ   ëP¬  à~  ëHY      I      «  ê+  ë@y   í  ë∏  ›   Ë   }   	n     # 	y     #   
+t   Ö   ´ÿ               Vö  ´G  ëpû  ´  ëh«  ´+  ë`¢  ¨+  ëX∑  ¨i  ëTª  ¨ÿ   ëH¬  Æ~  ë@Ÿ  ØA  ë∏≥  ∞i  ë¥É      ≤        ±i  ë∞ ≤      Ì      ∑      Ì      y   µ  ë®   ô   –i  p            Vö  –G  ëxÕ  “i  ët…            ”  ”~  ëh  
+•   ©   Ÿü        ö      Vö  ŸG  ëx §  Ø  √   ∏   À   ·@	      ‚	      Vö  ·G  ëx €   Í	      j
+      Vö  ÍG  ëx≥  Íi  ët Î   G  p
+      Û
+      Vö  ÒG  ëx L  W  =  3  !	Ù   ~  "# 	,  ~  ## É  é  #     	˙   ‚  # 	  i  #	  i  #	  i  #	  ~  # ü  D  ¯       g      Vö  ¯G  ëx      a            a         ˙~  ëp3      U        ¸~  ëh    N  _p      Ê      Vö  _~  ëx|      ‡      ä      ‡      ä      ≈        ai  ët    Z  Bü  †      9	      Vö  B~  ëx  Eü  ëp k  1      ﬂ      Vö  1~  ëx¸      Ÿ            Ÿ      '  3i  ët.  4‚  ëh   Ç  N~  ‡      ·      Vö  O~  ëx ç  m        Á      Vö  m~  ëp«  m+  ëh÷  mÿ   ë`Ÿ  nA  ëXû  o  ëPU      ’      	  ri  ëL  0  ;  ≠  ®  F  Q    "8	›  i  # 	û    #	„  i  #	≥  i  #	Î  Œ  #	˚  +  # 	∑  i   #(	÷  ÿ   !#0 
+ı   %  .:;'I?2@
+   :;I
+  4 :;I
+     I   I:;  :;  	 I:;8
+2  
+$ >   <  .:;'?2@
+  .:;I?2@
+  :;  .:;'2@
+  .:;'I2@
+  .:;I2@
+   ,         ˇˇˇˇ        ·                      f   3   ˚      .  core.c    range.h   bts.h     	        Å
+gFF◊◊G≠◊≠ª Y;…8K◊≠ª◊≠HY…7Yí Âªªë◊ªÉ'.
+ªFuÉ„ó÷
+=…ªu…ëÛ◊ë ÂYÉ..
+#N≠…ü/πıYK◊F≠ª≠BY…4 ë!ÂªªAÛAXYYªÉ‰
+ªF>‰~Ç
+ªFëÛ$ö
+ªF>=>
+ÂF◊º
+!ëG≠ªi
+ª◊≠◊ªëÉYº›~‰
+ª◊g;ıÂºJÚ
+ª………Q*/≠ºt
+!ëQ≠≠ª≠=J
+ Apple LLVM version 5.1 (clang-503.0.40) (based on LLVM 3.4svn) core.c /Users/J/Source/regex_engine core_match begin char end range_t core_match_continue core_groups int core_add_chunk _reg_chunk chunk_t core_add_branch core_set_branch core_new start chunks load capacity ngroup next _branch branch_t insert _reg_core core_t core_free branch_free branch_add_chunk branch_ensure_capacity branch_new branch_match obj str outer _bts bts_t ngr nbr groups curr stack count br gr top index matches recursive _Bool inner state_t next_index i new_chunk branch newcap newarray core_match core.c obj != NULL str != NULL groups != NULL core_match_continue *str != '\0' outer != NULL core_groups core_add_chunk core_add_branch core_set_branch core_new branch_add_chunk branch_ensure_capacity newarray != NULL branch_new obj->chunks != NULL HSAH                         ˇˇˇˇ         ˇˇˇˇ      ˇˇˇˇ	   
+   ˇˇˇˇ   ≥ÆC≠⁄pI¡…©›ü¬≠fH√Â1:öUkdÔô¿®∑∞ÓJ˛¶Uú((ˇu2ót[+º   Ã   ‹   Ï   ¸       ,  <  L  \  l  |  Z     “      c      &       ô            ©      p      €      ‡      k           À      µ      D     Á      Î            Ö            Ç     x      ç     •      N     d      HSAH                      ˇˇˇˇHSAH                      ˇˇˇˇHSAH                             ˇˇˇˇ      ˇˇˇˇ      ˇˇˇˇ	   
+   ˇˇˇˇ&”ò/‹c ï|ÅòÊˆÒı†√%Õs59€≠Ú±{Å0ÄàaÛ- ﬂá∑¨   ø   “   Â   ¯       1  D  W  j  #     É        ı     Œ  $      t        $      =     L        √      §        }      ›              F             é       •      i  $      ≠     0        3     W                j                     p      õ                            ◊                                                       ä                      †      ô                      @	      ¢                      	      z                      p
+      É                             g                      p      v                            Ô                      ‡                                  zR xê  $      P‡ˇˇˇˇˇˇj       AÜC       $   D   ò„ˇˇˇˇˇˇõ        AÜC       $   l   ‰ˇˇˇˇˇˇ◊        AÜC       $   î   »‰ˇˇˇˇˇˇ       AÜC       $   º   ¿Áˇˇˇˇˇˇä        AÜC       $   ‰   (Ëˇˇˇˇˇˇô        AÜC       $     †Ëˇˇˇˇˇˇ¢        AÜC       $   4  (Èˇˇˇˇˇˇz        AÜC       $   \  ÄÈˇˇˇˇˇˇÉ        AÜC       $   Ñ  ËÈˇˇˇˇˇˇg        AÜC       $   ¨  0Íˇˇˇˇˇˇv        AÜC       $   ‘  àÍˇˇˇˇˇˇÔ        AÜC       $   ¸  PÎˇˇˇˇˇˇ       AÜC       Œ  -  -…    Ω    ∂    Ç  6  -9  -  -4    (    !    Û  ;  -æ  :  -´  .  -r  -  -m    a    Z    ,  6  -‹  :  -–  :  -±  7  -]  :  -D    -…
+  -  -ƒ
+    ∏
+    ±
+    É
+  ;  -<
+  -  -7
+    +
+    $
+    ∏	    -§	    -â	  -  -Ñ	    x	    q	    	  9  -˜    -È  -  -‰    ÿ    —    ê    -t    -Y  -  -T    H    A  
+  ı  :  -⁄  4  -Ü  2  -x  /  -H  #  -˛  1  -Ë  4  -ü  1  -ë  4  -<  0  -  -  -  	      ˇ    ƒ    -q  5  -X  -  -S    G    @    »  8  -é  3  -Z  5  -B  0  -)  5  -π  -  -¥    ®    °    Q  :  -7  1  -˙  1  -Ï  4  -†  1  -í  4  -7  0  -˜    -Ê  4  -õ  2  -ê  /  -f  #  -  -  -	    ˝     ˆ      »   6  -∂   #  -ö   -  -ï     â     Ç      T   -  -O     C     <              ∫    ≤    å    Ñ    Q    I    @    8            Á    ﬂ    ∏    ∞    ß    ü    ñ    é    u    m    J    B    +    #            ˘    Ò    .    &    Ú    Í    «    ø    Ü    ~    Q    I    "        Ú    Í    ·    Ÿ    ¿    ∏    -    %    ±     ©     <     4          @     ∏     T∏     ¥     T¥     ∞     T∞     ¨     T¨     ®     T®     §     T§     †     T†     ú     Tú     ò     Tò     î     Tî     ê     Tê     å     Tå     à     Tà     ®     T®     §     T§     †     T†     ú     Tú     ò     Tò     î     Tî     ê     Tê     å     Tå     à     Tà     Ñ     TÑ     Ä     TÄ     Ä    `    @              ‡     ¿     †     Ä     `     @                 °    ö      ∑    •      æ    ¨      ∆    ∏      Œ    ƒ      ÷          ‰          ˚    ”          Á      "    Ù      *          D    ‡      P    †      b    F      ~          ñ          ±    -      Ã    =      ‡    p      Ì    W          n                -    ä      5    ê      ?    ¯      P    p       e    8!      u    `!      ê    à!      ª     @	      ^    ò       †           K    H       Ô            ì    !           p      #    –                       ®      ã           3            ›     p
+      Ü    Ë       Ã     	      r    ¿                                  0              Q              \              >              u              G              l              (              ˙              ~              ∞              f              Á               _core_match ___assert_rtn _core_groups _calloc ___memset_chk _bts_new _bts_push _bts_empty _bts_free _free _bts_top _bts_pop _chunk_match _core_match_continue _core_add_chunk _chunk_new _core_add_branch _core_set_branch _core_new _malloc _core_free _chunk_free ___memcpy_chk _core_match.eh _core_groups.eh _core_match_continue.eh _core_add_chunk.eh _core_add_branch.eh _core_set_branch.eh _core_new.eh _core_free.eh L___func__.core_match L_.str L_.str1 L_.str2 L_.str3 _branch_match L___func__.core_groups L___func__.core_match_continue L_.str4 L_.str5 L___func__.core_add_chunk _branch_new _branch_add_chunk L___func__.branch_add_chunk _branch_ensure_capacity L___func__.core_add_branch L___func__.core_set_branch L___func__.core_new _branch_free L___func__.branch_ensure_capacity L_.str6 L___func__.branch_new L_.str7 EH_frame0 _branch_match.eh _branch_add_chunk.eh _branch_free.eh _branch_ensure_capacity.eh _branch_new.eh  
