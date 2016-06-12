@@ -48,7 +48,7 @@ void atom_set_string(atom_t*, char*);
 
 /** give_core
   *
-  * Give atom posession of a nested core. This construct is used to
+  * Give atom possession of a nested core. This construct is used to
   * match groups within a regular expression. The int sets the atom's
   * internal flag:
   * 0 -> group, 1 -> atomic, 2 -> lookahead, 3 -> lookbehind,

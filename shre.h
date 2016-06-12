@@ -307,7 +307,7 @@ bool quick_entire(char*, char*);
 
 /** replace
   *
-  * Swaps out all leftmost non-overlapping occurances of pattern
+  * Swaps out all leftmost non-overlapping occurrences of pattern
   * in the first string with the second string. The string passed
   * into the function is not affected; a new string is allocated
   * and returned. If the pattern never matches the string, then
